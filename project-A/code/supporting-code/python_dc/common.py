@@ -23,7 +23,7 @@ NZ_TOL = 1e-6       # |a_i| > NZ_TOL counts as a changed meter
 
 def load_case():
     """Load the IEEE 57-bus MATPOWER case for the DC model."""
-    path = os.path.join(DATA, "data", "case57.m")
+    path = os.path.join(os.path.dirname(os.path.dirname(DATA)), "data", "case57.m")
     with open(path, encoding="utf-8") as f:
         text = f.read()
 

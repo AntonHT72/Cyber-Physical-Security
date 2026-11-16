@@ -117,7 +117,7 @@ print(f"max voltage-magnitude error: {np.abs(x_hat[n - 1:] - x_true[n - 1:]).max
 # The local linearized residual projector gives the usual AC BDD statistic.
 projection = H_hat @ np.linalg.solve(G, H_hat.T @ Rinv)
 J = r @ Rinv @ r
-K = m - x_true.size
+K = m - (x_true.size)
 tau = chi2.ppf(0.95, K)
 print(f"J = {J:.2f}   K = {K}   tau = {tau:.2f}")
 print(f"residual norm: {np.linalg.norm(r):.5f}")

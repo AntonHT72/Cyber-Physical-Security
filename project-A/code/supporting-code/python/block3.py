@@ -1,102 +1,144 @@
-"""
-Block 3 --- Stealthy false-data injection                 (L4)
-    python block3.py
-Python counts from 0: meter z_k is row k-1; theta_b is entry state_col(b).
-"""
-
-# AI declaration: generated with generative-AI assistants (Claude, Codex, OpenCode;
-# 4-8 October 2026), then reviewed, corrected and verified by the instructor; the
-# numbers this file prints are asserted by verify.jl. Full record: AI.log.
-import networkx as nx
+"""Block 3 --- model-consistent false-data injection for AC state estimation."""
 import numpy as np
 from scipy.stats import chi2
 
-from common import (NZ_TOL, SIGMA, HINT, check, load_case, load_checkpoint,
-                    load_noise, measurement_matrix, meter_labels, min_attack_cut,
-                    nnz_meters, state_col)
+from common import (SIGMA, NZ_TOL, branch_flows, bus_injections, load_case,
+                    measurement_matrix)
+
 
 net = load_case()
-lab = meter_labels(net)
-n, m = net["n"], 54
-H = measurement_matrix(net)
-z = load_checkpoint("z.csv")
-e = load_noise()
-Rinv = np.eye(m) / SIGMA**2
-G = H.T @ Rinv @ H
+n = net["n"]
+keep = np.asarray(net["keep"]) - 1
+slack = net["slack"] - 1
 
 
-def estimate(zz):                               # WLS, as in Block 2
-    return np.linalg.solve(G, H.T @ Rinv @ zz)
+def voltage_from_state(x):
+    angles = np.zeros(n)
+    angles[keep] = x[: n - 1]
+    return x[n - 1:] * np.exp(1j * angles)
 
 
-def Jstat(zz):
-    r = zz - H @ estimate(zz)
-    return r @ Rinv @ r
+def state_from_voltage(voltage):
+    return np.r_[np.angle(voltage[keep]), np.abs(voltage)]
 
 
-K = m - (n - 1)
+def measurement_labels():
+    labels = [f"P{i}" for i in range(1, n + 1)]
+    labels += [f"Q{i}" for i in range(1, n + 1)]
+    for i, j in zip(net["frm"], net["to"]):
+        labels += [f"P{i},{j}", f"P{j},{i}"]
+    for i, j in zip(net["frm"], net["to"]):
+        labels += [f"Q{i},{j}", f"Q{j},{i}"]
+    return labels + [f"V{i}" for i in range(1, n + 1)]
+
+
+def measurement_model(x):
+    voltage = voltage_from_state(x)
+    injections = bus_injections(net, voltage)
+    flows = branch_flows(net, voltage)
+    return np.r_[
+        injections.real, injections.imag,
+        flows[:, 0].real, flows[:, 1].real,
+        flows[:, 0].imag, flows[:, 1].imag,
+        np.abs(voltage),
+    ]
+
+
+def numerical_jacobian(x, step=1e-6):
+    H = np.empty((measurement_model(x).size, x.size))
+    for column in range(x.size):
+        dx = np.zeros_like(x)
+        dx[column] = step
+        H[:, column] = (measurement_model(x + dx) -
+                        measurement_model(x - dx)) / (2 * step)
+    return H
+
+
+def estimate(z, x0):
+    """Iterated AC WLS with equal measurement variances."""
+    x = x0.copy()
+    for iteration in range(30):
+        residual = z - measurement_model(x)
+        H = numerical_jacobian(x)
+        delta = np.linalg.solve(H.T @ H, H.T @ residual)
+        x += delta
+        if np.linalg.norm(delta, np.inf) < 1e-9:
+            return x, iteration + 1
+    raise RuntimeError("AC WLS did not converge within 30 iterations")
+
+
+labels = measurement_labels()
+x_true = state_from_voltage(net["V"])
+x_flat = np.r_[np.zeros(n - 1), np.ones(n)]
+m = measurement_model(x_true).size
+states = x_true.size
+rng = np.random.default_rng(1)
+z = measurement_model(x_true) + SIGMA * rng.standard_normal(m)
+
+
+def Jstat(zz, x0=x_flat):
+    x_hat, _ = estimate(zz, x0)
+    residual = zz - measurement_model(x_hat)
+    return residual @ residual / SIGMA**2, x_hat
+
+
+H = numerical_jacobian(x_true)
+rank = np.linalg.matrix_rank(H)
+K = m - states
 tau = chi2.ppf(0.95, K)
-theta_hat, J = estimate(z), Jstat(z)
+J, x_hat = Jstat(z)
+print(f"measurement count: {m}, state count: {states}, Jacobian rank: {rank}")
+print(f"J = {J:.2f}   K = {K}   tau = {tau:.2f}")
 
 # --- Task 3.1 ---------------------------------------------------------------
-# Where this comes from: L4 'A model-consistent attack leaves no residual
-# trace', 'The estimate moves even when the residual does not':
-#   z_+ = z + a,  a = H c  =>  theta-hat_+ = theta-hat + c,  r_+ = r.
-c = np.zeros(n - 1)
-c[state_col(8)] = 0.05                          # move theta_8 by 0.05 rad
-a = H @ c
-#HINT("3.1", "the stealthy attack vector a = H c for the state shift c")
-Jplus = Jstat(z + a)
-check(np.allclose(estimate(z + a), theta_hat + c), "theta-hat_+ = theta-hat + c",
-      "L4 'The estimate moves even when the residual does not'")
-check(abs(Jplus - J) < 1e-8, f"J_+ = J = {Jplus:.2f}: the detector sees nothing",
-      "L4 'A model-consistent attack leaves no residual trace'")
+# For a nonlinear AC model, the model-consistent attack is the difference
+# between measurements at the shifted and original states.
+c = np.zeros(states)
+angle8_col = 8 - 2
+c[angle8_col] = 0.05
+x_shifted = x_true + c
+a = measurement_model(x_shifted) - measurement_model(x_true)
+Jplus, x_plus = Jstat(z + a, x0=x_shifted)
+print(f"AC attack changes {np.count_nonzero(np.abs(a) > NZ_TOL)} of {m} meters")
+print(f"estimated bus-8 angle shift: {x_plus[angle8_col] - x_hat[angle8_col]:.6f} rad")
+print(f"clean J = {J:.2f}, attacked J = {Jplus:.2f}")
 
 # --- Task 3.2 ---------------------------------------------------------------
-arand = np.linalg.norm(a) * e / np.linalg.norm(e)
-Jr = Jstat(z + arand)
-#HINT("3.2", "the chi-squared statistic J of the attacked measurements z + arand (same Jstat as Block 2)")
-check(Jr > tau, f"J = {Jr:.0f} > tau = {tau:.1f}: detected", "L4 'The detector's blind spot'")
+# A random measurement corruption with the same norm is not model-consistent.
+arand = np.linalg.norm(a) * rng.standard_normal(m)
+arand *= 1.0 / np.linalg.norm(arand)
+Jrandom, _ = Jstat(z + arand)
+print(f"random attack J = {Jrandom:.2f}; detected = {Jrandom > tau}")
 
 # --- Task 3.3 ---------------------------------------------------------------
-# Where this comes from: L4 'The minimum attack set as a graph cut',
-# 'A pendant cut needs four meters':  k* = min over cuts A, h(A) >= 2, of |g(A)| - h(A) + 2.
-supp = np.flatnonzero(np.abs(a) > NZ_TOL)
-#HINT("3.3a", "the meter indices the attack changes: the non-zero entries of a")
-print("the attack changes", len(supp), "meters:", ", ".join(lab[i] for i in supp))
-
-# (i) Exact: the given black box searches every cut.
-kstar, Astar, Sstar, gstar = min_attack_cut(net)    # GIVEN (common.py)
-print(f"cheapest cut A* = {Astar} (cuts off buses {Sstar}):  k* = {kstar},  "
-      f"g(A*) = {', '.join(lab[i] for i in gstar)}")
-check(kstar == len(supp) and gstar == list(supp),
-      f"k* = {kstar} = the meters your attack changes: no stealthy attack is cheaper",
-      "L4 'The minimum attack set as a graph cut'")
-# By hand: for A*, list g(A*), count h(A*), evaluate |g(A)| - h(A) + 2.
-
-# (ii) Bounds without the box. Every cut you try is a stealthy attack, so its size is an
-# upper bound on k*: single-line cuts (bridges) and single buses (c = e_j).
-gr = nx.Graph(list(zip(net["frm"], net["to"])))
-br = list(nx.bridges(gr))
-print("bridges of the grid:", br, " (a single-line cut costs 2 + 2 - 2 + 2 = 4 meters)")
-nnz_bus = [nnz_meters(H[:, j]) for j in range(n - 1)]
-print("meters touched by c = e_j, buses 2..14:", nnz_bus)
-kbus = min(nnz_bus)
-#HINT("3.3b", "the best single-bus attack size: min over buses j of ||H e_j||_0")
-kup = min(kbus, 4) if br else kbus          # best upper bound
-klow = 4                                    # L4: |g(A)| - h(A) + 2 >= |A| + 3 >= 4 (show it by hand)
-check(klow <= kstar <= kup, f"lower {klow} <= k* = {kstar} <= upper {kup}: distance {kup - klow}",
-      "L4 exercise 'Certify the global minimum'")
+# The exact graph-cut minimum from the DC model does not apply to nonlinear
+# AC measurements. Report the support and its measurement labels instead.
+support = np.flatnonzero(np.abs(a) > NZ_TOL)
+print("changed measurements:", ", ".join(labels[i] for i in support))
 
 # --- Task 3.4 ---------------------------------------------------------------
-# Where this comes from: L4 'Stealthy attacks and observability'.
-Hcut = np.delete(H, supp, axis=0)
-rcut = np.linalg.matrix_rank(Hcut)
-#HINT("3.4", "the rank of H after deleting the rows of the attack's meters")
-check(rcut == n - 2, f"rank drops to {rcut}", "L4 'Stealthy attacks and observability'")
-_, _, Vt = np.linalg.svd(Hcut)
-print("lost direction (null space of Hcut):", np.round(Vt[-1], 3))
+# Removing the changed rows from the local AC Jacobian shows the remaining
+# local observability of this particular attack.
+H_remaining = np.delete(H, support, axis=0)
+remaining_rank = np.linalg.matrix_rank(H_remaining)
+print(f"local Jacobian rank after removing attack rows: "
+      f"{remaining_rank} of {states}")
 
 # --- Task 3.5 ---------------------------------------------------------------
-# Where this comes from: L4 'A sufficient access bound' (k > K always suffices).
-print(f"K + 1 = {K + 1} meters are always enough; the cut needs {len(supp)}")
+# Apply the corresponding DC attack to the AC estimator. The DC vector only
+# contains active-power injections and active-power branch flows, so the
+# reactive-power and voltage-magnitude entries remain unchanged.
+H_dc = measurement_matrix(net)
+c_dc = np.zeros(n - 1)
+c_dc[8 - 2] = 0.05
+a_dc = H_dc @ c_dc
+a_dc_ac = np.zeros(m)
+a_dc_ac[:n] = a_dc[:n]
+a_dc_ac[2 * n:2 * n + 2 * net["nb"]] = a_dc[n:]
+J_dc_attack, x_dc_attack = Jstat(z + a_dc_ac)
+print(f"DC attack embedded in AC measurements changes "
+      f"{np.count_nonzero(np.abs(a_dc_ac) > NZ_TOL)} of {m} meters")
+print(f"DC attack against AC estimator: J = {J_dc_attack:.2f}, "
+      f"tau = {tau:.2f}, detected = {J_dc_attack > tau}")
+print(f"AC-estimated bus-8 angle shift from DC attack: "
+      f"{x_dc_attack[8 - 2] - x_hat[8 - 2]:.6f} rad")

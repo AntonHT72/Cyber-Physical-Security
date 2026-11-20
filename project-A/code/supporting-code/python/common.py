@@ -58,6 +58,7 @@ def load_case():
     to = branch[:, 1].astype(int).tolist()
     return {
         "n": n, "nb": branch.shape[0], "slack": slack,
+        "bus_type": bus[:, 1].astype(int),
         "keep": [b for b in range(1, n + 1) if b != slack],
         "frm": frm, "to": to,
         "r": branch[:, 2], "x": branch[:, 3], "b": branch[:, 4],
